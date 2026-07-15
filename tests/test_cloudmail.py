@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import call, patch
 
 import grok_register_ttk as app
+from email_providers import cloudmail as cloudmail_provider
 
 
 class DummyResponse:
@@ -20,10 +21,6 @@ class DummyResponse:
 class CloudMailTests(unittest.TestCase):
     def setUp(self):
         self.original_config = app.config.copy()
-        self.original_domain_index = app._cloudmail_domain_index
-        self.original_public_token = app._cloudmail_public_token
-        self.original_public_token_config = app._cloudmail_public_token_config
-        self.original_account_ids = app._cloudmail_account_ids.copy()
         self.env_patch = patch.dict(
             os.environ,
             {
@@ -34,19 +31,12 @@ class CloudMailTests(unittest.TestCase):
         )
         self.env_patch.start()
         app.config = app.DEFAULT_CONFIG.copy()
-        app._cloudmail_domain_index = 0
-        app._cloudmail_public_token = None
-        app._cloudmail_public_token_config = None
-        app._cloudmail_account_ids.clear()
+        cloudmail_provider.reset_runtime_state()
 
     def tearDown(self):
         self.env_patch.stop()
         app.config = self.original_config
-        app._cloudmail_domain_index = self.original_domain_index
-        app._cloudmail_public_token = self.original_public_token
-        app._cloudmail_public_token_config = self.original_public_token_config
-        app._cloudmail_account_ids.clear()
-        app._cloudmail_account_ids.update(self.original_account_ids)
+        cloudmail_provider.reset_runtime_state()
 
     def configure_cloudmail(self):
         app.config.update(
@@ -66,7 +56,8 @@ class CloudMailTests(unittest.TestCase):
         ]
 
         with patch.object(app, "http_post", side_effect=responses) as post:
-            result = app.cloudmail_add_address(
+            result = cloudmail_provider.add_address(
+                app.http_post,
                 "https://mail.example.com",
                 "admin@example.com",
                 "admin-password",
@@ -100,16 +91,17 @@ class CloudMailTests(unittest.TestCase):
         self.configure_cloudmail()
 
         with patch.object(app, "generate_username", return_value="randomuser"), patch.object(
-            app,
-            "cloudmail_add_address",
+            cloudmail_provider,
+            "add_address",
             return_value={"accountId": 91},
         ) as add_address:
             address, token = app.get_email_and_token()
 
         self.assertEqual(address, "randomuser@first.example")
         self.assertEqual(token, "cloudmail_catch_all")
-        self.assertEqual(app._cloudmail_account_ids[address], 91)
+        self.assertEqual(cloudmail_provider._account_ids[address], 91)
         add_address.assert_called_once_with(
+            app.http_post,
             "https://mail.example.com",
             "admin@example.com",
             "admin-password",
@@ -127,8 +119,8 @@ class CloudMailTests(unittest.TestCase):
             )
 
         with patch.object(app, "http_post", side_effect=fake_post):
-            messages = app.cloudmail_public_email_list(
-                "https://mail.example.com", "public-token", "user@first.example"
+            messages = cloudmail_provider.public_email_list(
+                app.http_post, "https://mail.example.com", "public-token", "user@first.example"
             )
 
         self.assertEqual(messages, [{"emailId": "mail-1"}])
@@ -141,19 +133,43 @@ class CloudMailTests(unittest.TestCase):
     def test_public_token_is_cached_until_cloudmail_config_changes(self):
         self.configure_cloudmail()
         with patch.object(
-            app,
-            "cloudmail_gen_public_token",
+            cloudmail_provider,
+            "gen_public_token",
             side_effect=["first-token", "second-token"],
         ) as generate:
-            self.assertEqual(app._cloudmail_get_shared_token(), "first-token")
-            self.assertEqual(app._cloudmail_get_shared_token(), "first-token")
-            app.config["cloudmail_password"] = "changed-password"
-            self.assertEqual(app._cloudmail_get_shared_token(), "second-token")
+            self.assertEqual(
+                cloudmail_provider.get_shared_token(
+                    app.http_post,
+                    "https://mail.example.com",
+                    "admin@example.com",
+                    "admin-password",
+                ),
+                "first-token",
+            )
+            self.assertEqual(
+                cloudmail_provider.get_shared_token(
+                    app.http_post,
+                    "https://mail.example.com",
+                    "admin@example.com",
+                    "admin-password",
+                ),
+                "first-token",
+            )
+            self.assertEqual(
+                cloudmail_provider.get_shared_token(
+                    app.http_post,
+                    "https://mail.example.com",
+                    "admin@example.com",
+                    "changed-password",
+                ),
+                "second-token",
+            )
 
         self.assertEqual(generate.call_count, 2)
         self.assertEqual(
             generate.call_args_list[1],
             call(
+                app.http_post,
                 "https://mail.example.com",
                 "admin@example.com",
                 "changed-password",
@@ -163,7 +179,7 @@ class CloudMailTests(unittest.TestCase):
     def test_code_polling_parses_html_and_cleans_up_address(self):
         self.configure_cloudmail()
         email = "randomuser@first.example"
-        app._cloudmail_account_ids[email] = 91
+        cloudmail_provider._account_ids[email] = 91
         messages = [
             {
                 "emailId": "mail-1",
@@ -173,11 +189,11 @@ class CloudMailTests(unittest.TestCase):
         ]
 
         with patch.object(
-            app, "_cloudmail_get_shared_token", return_value="public-token"
+            cloudmail_provider, "get_shared_token", return_value="public-token"
         ), patch.object(
-            app, "cloudmail_public_email_list", return_value=messages
+            cloudmail_provider, "public_email_list", return_value=messages
         ) as email_list, patch.object(
-            app, "cloudmail_delete_address"
+            cloudmail_provider, "delete_address"
         ) as delete_address:
             code = app.cloudmail_get_oai_code(
                 "ignored", email, timeout=1, poll_interval=0
@@ -185,15 +201,21 @@ class CloudMailTests(unittest.TestCase):
 
         self.assertEqual(code, "123456")
         email_list.assert_called_once_with(
-            "https://mail.example.com", "public-token", to_email=email, size=20
+            app.http_post,
+            "https://mail.example.com",
+            "public-token",
+            to_email=email,
+            size=20,
         )
         delete_address.assert_called_once_with(
+            app.http_post,
+            app.http_delete,
             "https://mail.example.com",
             "admin@example.com",
             "admin-password",
             91,
         )
-        self.assertNotIn(email, app._cloudmail_account_ids)
+        self.assertNotIn(email, cloudmail_provider._account_ids)
 
     def test_dispatches_verification_lookup_to_cloudmail(self):
         app.config["email_provider"] = "cloudmail"
