@@ -67,6 +67,7 @@ cp config.example.json config.json
 | --- | --- |
 | `cpa_auto_add` | 是否注册后 SSO→CPA auth（关则只保存 SSO） |
 | `register_workers` | 并发浏览器数，默认 1，最大 8 |
+| `debug_mode` | 调试模式：强制单账号、结束后不关闭浏览器 |
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
 | `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |

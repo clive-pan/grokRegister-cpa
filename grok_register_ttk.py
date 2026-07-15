@@ -21,6 +21,7 @@ import random
 import re
 import string
 import json
+import base64
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -69,6 +70,7 @@ DEFAULT_CONFIG = {
     "cloudflare_path_messages": "/api/mails",
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
+    "debug_mode": False,
     "register_count": 1,
     "register_workers": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -1119,26 +1121,222 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 
+def enable_nsfw_via_browser(token="", log_callback=None):
+    """在已登录的注册浏览器内调用 grok.com 接口，绕过外部 HTTP 的 CF 拦截。"""
+    page_obj = _active_page()
+    if page_obj is None:
+        return False, "浏览器页面未就绪"
+
+    birth = generate_random_birthdate()
+    nsfw_bytes = encode_grpc_nsfw_settings()
+    nsfw_b64 = base64.b64encode(nsfw_bytes).decode("ascii")
+
+    try:
+        if log_callback:
+            log_callback("[*] 浏览器内开启 NSFW：打开 grok.com ...")
+        # 确保 SSO cookie 在浏览器上下文中
+        if token:
+            try:
+                page_obj.set.cookies(
+                    [
+                        {"name": "sso", "value": token, "domain": ".x.ai", "path": "/"},
+                        {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/"},
+                        {"name": "sso", "value": token, "domain": ".grok.com", "path": "/"},
+                        {"name": "sso-rw", "value": token, "domain": ".grok.com", "path": "/"},
+                    ]
+                )
+            except Exception:
+                try:
+                    page_obj.run_js(
+                        """
+const token = arguments[0];
+document.cookie = 'sso=' + token + '; path=/; domain=.grok.com';
+document.cookie = 'sso-rw=' + token + '; path=/; domain=.grok.com';
+                        """,
+                        token,
+                    )
+                except Exception:
+                    pass
+        page_obj.get("https://grok.com/")
+        try:
+            page_obj.wait.doc_loaded()
+        except Exception:
+            pass
+        # 等 CF 挑战结束，否则 fetch 也会拿到 Just a moment
+        for i in range(25):
+            try:
+                title = str(page_obj.run_js("return document.title || '';") or "").lower()
+                body = str(
+                    page_obj.run_js(
+                        "return (document.body && (document.body.innerText||'')) || '';"
+                    )
+                    or ""
+                ).lower()
+                if "just a moment" not in title and "just a moment" not in body[:200]:
+                    if "checking your browser" not in body[:300]:
+                        break
+            except Exception:
+                pass
+            time.sleep(1.0)
+        else:
+            if log_callback:
+                log_callback("[!] grok.com 仍停在 Cloudflare 挑战页，浏览器内 NSFW 可能失败")
+        time.sleep(1.0)
+
+        result = page_obj.run_js(
+            r"""
+const birthDate = arguments[0];
+const nsfwB64 = arguments[1];
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return arr;
+}
+return (async () => {
+  const out = { birthStatus: 0, birthBody: '', nsfwStatus: 0, nsfwBody: '', url: location.href };
+  try {
+    const birthRes = await fetch('https://grok.com/rest/auth/set-birth-date', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'content-type': 'application/json',
+        'origin': 'https://grok.com',
+        'referer': 'https://grok.com/',
+      },
+      body: JSON.stringify({ birthDate }),
+    });
+    out.birthStatus = birthRes.status;
+    out.birthBody = (await birthRes.text()).slice(0, 240);
+  } catch (e) {
+    out.birthBody = String(e);
+  }
+  const birthOk = (out.birthStatus >= 200 && out.birthStatus < 300)
+    || /birth-date-change-limit-reached|Birth date is locked|already set/i.test(out.birthBody || '');
+  if (!birthOk && out.birthStatus !== 0) {
+    return out;
+  }
+  try {
+    const body = b64ToBytes(nsfwB64);
+    const nsfwRes = await fetch('https://grok.com/auth_mgmt.AuthManagement/UpdateUserFeatureControls', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'content-type': 'application/grpc-web+proto',
+        'x-grpc-web': '1',
+        'origin': 'https://grok.com',
+        'referer': 'https://grok.com/',
+      },
+      body,
+    });
+    out.nsfwStatus = nsfwRes.status;
+    out.nsfwBody = (await nsfwRes.text()).slice(0, 240);
+  } catch (e) {
+    out.nsfwBody = String(e);
+  }
+  return out;
+})();
+            """,
+            birth,
+            nsfw_b64,
+        )
+        if not isinstance(result, dict):
+            return False, f"浏览器 NSFW 返回异常: {result!r}"
+
+        if log_callback:
+            log_callback(
+                f"[Debug] browser NSFW birth={result.get('birthStatus')} "
+                f"nsfw={result.get('nsfwStatus')} body={str(result.get('birthBody') or '')[:120]}"
+            )
+
+        birth_status = int(result.get("birthStatus") or 0)
+        birth_body = str(result.get("birthBody") or "")
+        birth_ok = (200 <= birth_status < 300) or (
+            birth_status in (400, 409, 429)
+            and (
+                "birth-date-change-limit-reached" in birth_body
+                or "Birth date is locked" in birth_body
+                or "already set" in birth_body.lower()
+            )
+        )
+        if not birth_ok:
+            if "just a moment" in birth_body.lower() or birth_status == 403:
+                return False, f"浏览器内 set_birth_date 仍被 CF 拦截 HTTP {birth_status}"
+            return False, f"浏览器内 set_birth_date HTTP {birth_status}: {birth_body[:160]}"
+
+        nsfw_status = int(result.get("nsfwStatus") or 0)
+        nsfw_body = str(result.get("nsfwBody") or "")
+        if 200 <= nsfw_status < 300:
+            return True, "成功开启 NSFW（浏览器内）"
+        if "just a moment" in nsfw_body.lower() or nsfw_status == 403:
+            return False, f"浏览器内 update_nsfw 被 CF 拦截 HTTP {nsfw_status}"
+        return False, f"浏览器内 update_nsfw HTTP {nsfw_status}: {nsfw_body[:160]}"
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 浏览器内 NSFW 异常: {exc}")
+        return False, f"浏览器内 NSFW 异常: {exc}"
+
+
 def enable_nsfw_for_token(token, cf_clearance="", user_agent="", log_callback=None):
     proxies = get_proxies()
     # cf_clearance 与签发它的浏览器 UA 严格绑定，优先用注册浏览器的真实 UA
     ua = user_agent or get_user_agent()
+    if log_callback:
+        log_callback(
+            f"[Debug] NSFW 准备: cf_clearance={'有' if cf_clearance else '无'} | ua_len={len(ua)} | browser={'有' if _active_page() else '无'}"
+        )
+
+    # 优先浏览器内请求（真实页面上下文，成功率高于外部 HTTP）
+    if _active_page() is not None:
+        ok, message = enable_nsfw_via_browser(token=token, log_callback=log_callback)
+        if ok:
+            return True, message
+        if log_callback:
+            log_callback(f"[!] 浏览器内 NSFW 未成功: {message}，回退 HTTP 方式...")
+
     try:
         with requests.Session(impersonate="chrome120", proxies=proxies) as session:
             cookie_parts = [f"sso={token}", f"sso-rw={token}"]
+            if not cf_clearance:
+                cf_clearance, ua2 = extract_cf_clearance_and_ua(
+                    log_callback=log_callback, ensure_grok=True
+                )
+                if ua2:
+                    ua = ua2
             if cf_clearance:
                 cookie_parts.append(f"cf_clearance={cf_clearance}")
             session.headers.update(
                 {
                     "user-agent": ua,
                     "cookie": "; ".join(cookie_parts),
+                    "accept": "application/json, text/plain, */*",
+                    "accept-language": "en-US,en;q=0.9",
                 }
             )
             ok, message = set_tos_accepted(session, log_callback)
             if not ok:
                 return False, message
             ok, message = set_birth_date(session, log_callback)
+            if (not ok) and ("Cloudflare" in str(message) or "403" in str(message)):
+                if log_callback:
+                    log_callback("[*] set_birth_date 被 CF 拦截，刷新 cf_clearance 后重试...")
+                cf_clearance, ua2 = extract_cf_clearance_and_ua(
+                    log_callback=log_callback, ensure_grok=True
+                )
+                if ua2:
+                    ua = ua2
+                if cf_clearance:
+                    cookie_parts = [f"sso={token}", f"sso-rw={token}", f"cf_clearance={cf_clearance}"]
+                    session.headers["cookie"] = "; ".join(cookie_parts)
+                    session.headers["user-agent"] = ua
+                    ok, message = set_birth_date(session, log_callback)
             if not ok:
+                # 最后再试一次浏览器内
+                if _active_page() is not None:
+                    ok2, msg2 = enable_nsfw_via_browser(token=token, log_callback=log_callback)
+                    if ok2:
+                        return True, msg2
+                    return False, f"{message}; browser fallback: {msg2}"
                 return False, message
             ok, message = update_nsfw_settings(session, log_callback)
             if not ok:
@@ -1326,7 +1524,14 @@ def start_browser(log_callback=None):
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
-def stop_browser():
+def is_debug_mode():
+    return bool(config.get("debug_mode", False))
+
+
+def stop_browser(force=False):
+    """关闭当前线程浏览器。调试模式默认保留窗口，除非 force=True。"""
+    if is_debug_mode() and not force:
+        return
     current = _active_browser()
     _set_browser_session(None, None)
     if current is None:
@@ -1339,22 +1544,30 @@ def stop_browser():
 
 
 def restart_browser(log_callback=None):
-    stop_browser()
+    stop_browser(force=True)
     return start_browser(log_callback=log_callback)
 
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
     try:
+        if is_debug_mode():
+            if log_callback:
+                log_callback(f"[*] 调试模式：保留浏览器（{reason}）")
+            collected = gc.collect()
+            if log_callback:
+                log_callback(f"[*] Python GC 已回收对象数: {collected}")
+            return
         if log_callback:
             log_callback(f"[*] {reason}: 关闭浏览器并清理内存")
-        stop_browser()
+        stop_browser(force=True)
         collected = gc.collect()
         if log_callback:
             log_callback(f"[*] Python GC 已回收对象数: {collected}")
     except BaseException:
         # 退出清理中再收到 Ctrl+C 时静默结束，不向外抛
         try:
-            stop_browser()
+            if not is_debug_mode():
+                stop_browser(force=True)
         except BaseException:
             pass
 
@@ -1375,14 +1588,11 @@ def refresh_active_page():
     return page
 
 
-def extract_cf_clearance_and_ua(log_callback=None):
+def extract_cf_clearance_and_ua(log_callback=None, ensure_grok=True):
     """从注册浏览器提取 grok.com 的 cf_clearance 及其绑定的真实 UA。
 
-    注册流程能拿到 sso 说明浏览器已通过 grok.com 的 Cloudflare 盾，
-    此刻 cf_clearance 就在浏览器 cookie 里，配合真实 UA 可用于后续 NSFW 请求。
-
-    返回:
-      - (cf_clearance str, user_agent str)：任一取不到则为空字符串
+    注册多半停在 accounts.x.ai，未必有 grok.com 的 cf_clearance。
+    ensure_grok=True 时会先打开 https://grok.com/ 让浏览器过盾再取 cookie。
     """
     cf_clearance = ""
     user_agent = ""
@@ -1390,23 +1600,84 @@ def extract_cf_clearance_and_ua(log_callback=None):
         active = refresh_active_page()
         if active is None:
             return "", ""
-        cookies = active.cookies(all_domains=True, all_info=True) or []
-        for item in cookies:
-            if isinstance(item, dict):
-                name = str(item.get("name", "")).strip()
-                value = str(item.get("value", "")).strip()
-            else:
-                name = str(getattr(item, "name", "")).strip()
-                value = str(getattr(item, "value", "")).strip()
-            if name == "cf_clearance" and value:
-                cf_clearance = value
-                break
-        try:
-            ua = active.run_js("return navigator.userAgent;")
-            if ua:
-                user_agent = str(ua).strip()
-        except Exception:
-            pass
+
+        def _read_cf_and_ua(page_obj, grok_only=False):
+            clearance = ""
+            ua_text = ""
+            cookies = page_obj.cookies(all_domains=True, all_info=True) or []
+            for item in cookies:
+                if isinstance(item, dict):
+                    name = str(item.get("name", "")).strip()
+                    value = str(item.get("value", "")).strip()
+                    domain = str(item.get("domain", "")).strip().lower()
+                else:
+                    name = str(getattr(item, "name", "")).strip()
+                    value = str(getattr(item, "value", "")).strip()
+                    domain = str(getattr(item, "domain", "")).strip().lower()
+                if name != "cf_clearance" or not value:
+                    continue
+                # set-birth-date 在 grok.com：必须用 grok.com 域 clearance，其它域的无效
+                if grok_only and "grok.com" not in domain:
+                    continue
+                if "grok.com" in domain:
+                    clearance = value
+                    break
+                if not clearance and not grok_only:
+                    clearance = value
+            try:
+                ua = page_obj.run_js("return navigator.userAgent;")
+                if ua:
+                    ua_text = str(ua).strip()
+            except Exception:
+                pass
+            return clearance, ua_text
+
+        def _page_passed_cf(page_obj):
+            try:
+                title = str(page_obj.run_js("return document.title || '';") or "").lower()
+                body = str(
+                    page_obj.run_js(
+                        "return (document.body && (document.body.innerText||'')) || '';"
+                    )
+                    or ""
+                ).lower()
+                if "just a moment" in title or "just a moment" in body[:200]:
+                    return False
+                if "checking your browser" in body[:300]:
+                    return False
+                return True
+            except Exception:
+                return False
+
+        # 只要 grok.com 域下的 clearance；其它域的不算
+        cf_clearance, user_agent = _read_cf_and_ua(active, grok_only=True)
+        if ensure_grok and not cf_clearance:
+            if log_callback:
+                log_callback("[*] 未找到 grok.com 的 cf_clearance，打开 grok.com 过盾...")
+            try:
+                active.get("https://grok.com/")
+                try:
+                    active.wait.doc_loaded()
+                except Exception:
+                    pass
+                time.sleep(2)
+                for i in range(20):
+                    if _page_passed_cf(active):
+                        cf_clearance, user_agent = _read_cf_and_ua(active, grok_only=True)
+                        if cf_clearance:
+                            break
+                    time.sleep(1.0)
+                if log_callback:
+                    if cf_clearance:
+                        log_callback("[*] 已取得 grok.com 的 cf_clearance")
+                    else:
+                        log_callback(
+                            "[!] 打开 grok.com 后仍无有效 cf_clearance（页面可能仍卡在 Just a moment）"
+                        )
+            except Exception as nav_exc:
+                if log_callback:
+                    log_callback(f"[Debug] 打开 grok.com 取 cf_clearance 失败: {nav_exc}")
+                cf_clearance, user_agent = _read_cf_and_ua(active, grok_only=True)
     except Exception as exc:
         if log_callback:
             log_callback(f"[Debug] 提取 cf_clearance 失败: {exc}")
@@ -2682,9 +2953,16 @@ class GrokRegisterGUI:
         add_field(self.count_spinbox, 0, 3, sticky=tk.W)
 
         add_label(1, 0, "注册选项:")
+        opt_frame = tk.Frame(config_frame, bg=UI_PANEL_BG)
+        add_field(opt_frame, 1, 1, sticky=tk.W)
         self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
-        self.nsfw_check = tk_checkbutton(config_frame, text="注册后开启 NSFW", variable=self.nsfw_var)
-        add_field(self.nsfw_check, 1, 1, sticky=tk.W)
+        self.nsfw_check = tk_checkbutton(opt_frame, text="注册后开启 NSFW（可选）", variable=self.nsfw_var)
+        self.nsfw_check.pack(side=tk.LEFT)
+        self.debug_mode_var = tk.BooleanVar(value=bool(config.get("debug_mode", False)))
+        self.debug_mode_check = tk_checkbutton(
+            opt_frame, text="调试模式（可选）", variable=self.debug_mode_var
+        )
+        self.debug_mode_check.pack(side=tk.LEFT, padx=(12, 0))
 
         add_label(1, 2, "代理（可选）:")
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
@@ -2728,15 +3006,15 @@ class GrokRegisterGUI:
             value=str(config.get("duckmail_api_base", "") or DUCKMAIL_API_BASE_DEFAULT)
         )
         self._duckmail_widgets = [
-            p_label(0, 0, "API Base:"),
+            p_label(0, 0, "API Base（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.duckmail_api_base_var, width=52), 0, 1, columnspan=3),
-            p_label(1, 0, "API Key (可选):"),
+            p_label(1, 0, "API Key（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.api_key_var, width=34), 1, 1),
             p_label(1, 2, "说明:"),
             p_field(
                 tk_label(
                     self.provider_frame,
-                    text="Mail.tm 填 https://api.mail.tm；DuckMail 默认 api.duckmail.sbs",
+                    text="Mail.tm 填 https://api.mail.tm；公共域可不填 Key",
                     bg=UI_PANEL_BG,
                 ),
                 1,
@@ -2764,7 +3042,7 @@ class GrokRegisterGUI:
         self._cloudflare_widgets = [
             p_label(0, 0, "API Base:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_api_base_var, width=52), 0, 1, columnspan=3),
-            p_label(1, 0, "鉴权模式:"),
+            p_label(1, 0, "鉴权模式（可选）:"),
             p_field(
                 tk_option_menu(
                     self.provider_frame,
@@ -2776,13 +3054,13 @@ class GrokRegisterGUI:
                 1,
                 sticky=tk.W,
             ),
-            p_label(1, 2, "API Key:"),
+            p_label(1, 2, "API Key（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_api_key_var, width=34), 1, 3),
-            p_label(2, 0, "收信域名:"),
+            p_label(2, 0, "收信域名（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.default_domains_var, width=34), 2, 1),
-            p_label(2, 2, "全局密码:"),
+            p_label(2, 2, "全局密码（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_custom_auth_var, width=34), 2, 3),
-            p_label(3, 0, "CF 路径:"),
+            p_label(3, 0, "CF 路径（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.cloudflare_paths_var, width=52), 3, 1, columnspan=3),
         ]
 
@@ -2791,15 +3069,15 @@ class GrokRegisterGUI:
         self.yyds_jwt_var = tk.StringVar(value=str(config.get("yyds_jwt", "")))
         self.yyds_default_domain_var = tk.StringVar(value=str(config.get("yyds_default_domain", "")))
         self._yyds_widgets = [
-            p_label(0, 0, "API Key:"),
+            p_label(0, 0, "API Key（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.yyds_api_key_var, width=34), 0, 1),
-            p_label(0, 2, "JWT:"),
+            p_label(0, 2, "JWT（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.yyds_jwt_var, width=34), 0, 3),
-            p_label(1, 0, "固定收信域名:"),
+            p_label(1, 0, "固定收信域名（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.yyds_default_domain_var, width=34), 1, 1),
             p_label(1, 2, "说明:"),
             p_field(
-                tk_label(self.provider_frame, text="域名留空则自动选已验证域", bg=UI_PANEL_BG),
+                tk_label(self.provider_frame, text="Key/JWT 二选一；域名留空则自动选", bg=UI_PANEL_BG),
                 1,
                 3,
                 sticky=tk.W,
@@ -2814,7 +3092,7 @@ class GrokRegisterGUI:
         self._mailnest_widgets = [
             p_label(0, 0, "API Key:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.mailnest_api_key_var, width=34), 0, 1),
-            p_label(0, 2, "项目代码:"),
+            p_label(0, 2, "项目代码（可选）:"),
             p_field(tk_entry(self.provider_frame, textvariable=self.mailnest_project_code_var, width=34), 0, 3),
         ]
 
@@ -2853,7 +3131,7 @@ class GrokRegisterGUI:
             "cloudmail": self._cloudmail_widgets,
         }
 
-        add_label(3, 0, "并发数:")
+        add_label(3, 0, "并发数（可选）:")
         self.workers_var = tk.StringVar(value=str(config.get("register_workers", 1)))
         self.workers_spinbox = tk.Spinbox(
             config_frame,
@@ -2889,7 +3167,7 @@ class GrokRegisterGUI:
         self.cpa_auto_add_var = tk.BooleanVar(value=bool(config.get("cpa_auto_add", False)))
         tk_checkbutton(
             self.cpa_frame,
-            text="注册成功后将 SSO 转为 CPA auth 并入库",
+            text="开启后注册成功会将 SSO 转为 CPA auth 并入库（不勾选则只保存 SSO）",
             variable=self.cpa_auto_add_var,
         ).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=3)
 
@@ -3055,6 +3333,7 @@ class GrokRegisterGUI:
 
         config["email_provider"] = self.email_provider_var.get().strip() or "cloudflare"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
+        config["debug_mode"] = bool(self.debug_mode_var.get())
         config["proxy"] = self.proxy_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
         config["duckmail_api_base"] = self.duckmail_api_base_var.get().strip() or DUCKMAIL_API_BASE_DEFAULT
@@ -3115,6 +3394,13 @@ class GrokRegisterGUI:
             workers = int(self.workers_var.get())
         except Exception:
             workers = 1
+        if config.get("debug_mode"):
+            if count != 1 or workers != 1:
+                self.log("[*] 调试模式：强制 数量=1、并发=1，结束后不关闭浏览器")
+            count = 1
+            workers = 1
+            self.count_var.set("1")
+            self.workers_var.set("1")
         workers = max(1, min(workers, 8, count))
         config["register_count"] = count
         config["register_workers"] = workers
@@ -3132,8 +3418,11 @@ class GrokRegisterGUI:
         self._set_running_ui(True)
         self._stats_lock = threading.Lock()
         self._accounts_lock = threading.Lock()
-        self.log(f"[*] 配置已保存，开始执行。目标数量: {count} | 并发: {workers}")
-        if int(self.workers_var.get() or 1) > count:
+        self.log(
+            f"[*] 配置已保存，开始执行。目标数量: {count} | 并发: {workers}"
+            + (" | 调试模式" if config.get("debug_mode") else "")
+        )
+        if int(self.workers_var.get() or 1) > count and not config.get("debug_mode"):
             self.log(f"[*] 并发已自动调整为 {workers}（不超过注册数量）")
         self.log(f"[*] SSO→auth: {'开' if config.get('cpa_auto_add') else '关（仅保存 SSO）'}")
         self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
@@ -3351,13 +3640,7 @@ class GrokRegisterGUI:
                 stop_browser()
             except BaseException:
                 pass
-            # 多 worker 时由 _run_registration_entry 统一收尾 UI
-            if workers <= 1:
-                self._set_running_ui(False)
-                self.log(
-                    f"[*] 任务结束。成功 {self.success_count} | 失败 {self.fail_count}"
-                    + (f" | {format_fail_stats(self.fail_stats)}" if self.fail_count else "")
-                )
+            # 收尾 UI / 汇总只由 _run_registration_entry 负责，避免打印两次
 
 
 class CliStopController:
@@ -3704,6 +3987,10 @@ def run_registration_cli(count):
 def main_cli():
     load_config()
     count = int(config.get("register_count", 1) or 1)
+    if config.get("debug_mode"):
+        count = 1
+        config["register_workers"] = 1
+        cli_log("[*] 调试模式：强制单账号，结束后不关闭浏览器")
     cli_log("[*] CLI 已加载配置")
     cli_log(f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count}")
     cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
