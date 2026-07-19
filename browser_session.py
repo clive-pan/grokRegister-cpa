@@ -11,20 +11,57 @@ import time
 import uuid
 from typing import Callable, Optional, Tuple
 
+import psutil
 from DrissionPage import Chromium, ChromiumOptions
+
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    _user32 = ctypes.windll.user32
+    _window_enum_callback = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+    )
+    _user32.EnumWindows.argtypes = [_window_enum_callback, wintypes.LPARAM]
+    _user32.EnumWindows.restype = wintypes.BOOL
+    _user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    _user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    _user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    _user32.IsWindowVisible.restype = wintypes.BOOL
+    _user32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    _user32.SetWindowPos.restype = wintypes.BOOL
+    _user32.IsWindow.argtypes = [wintypes.HWND]
+    _user32.IsWindow.restype = wintypes.BOOL
+    _user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    _user32.SetForegroundWindow.restype = wintypes.BOOL
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.GetForegroundWindow.restype = wintypes.HWND
 
 _tls = threading.local()
 _get_proxy: Optional[Callable[[], dict]] = None
 _extension_path: str = ""
+_keep_windows_background: bool = False
 _start_fail_lock = threading.Lock()
 _start_fail_streak = 0
 _start_fail_threshold = 3
 
 
-def configure(get_proxies=None, extension_path=""):
-    global _get_proxy, _extension_path
+def configure(get_proxies=None, extension_path="", keep_windows_background=False):
+    global _get_proxy, _extension_path, _keep_windows_background
     _get_proxy = get_proxies
     _extension_path = extension_path or ""
+    _keep_windows_background = bool(keep_windows_background)
 
 
 def get_start_fail_streak() -> int:
@@ -62,6 +99,149 @@ def active_page():
 def set_browser_session(browser_obj=None, page_obj=None):
     _tls.browser = browser_obj
     _tls.page = page_obj
+
+
+def _windows_process_tree(root_pid: int) -> set[int]:
+    """返回 root_pid 及其所有后代进程。"""
+    if os.name != "nt" or root_pid <= 0:
+        return {root_pid} if root_pid > 0 else set()
+    try:
+        root = psutil.Process(root_pid)
+        return {root_pid, *(child.pid for child in root.children(recursive=True))}
+    except (psutil.Error, OSError):
+        return {root_pid}
+
+
+def _set_idle_priority(process_ids: set[int]) -> set[int]:
+    if os.name != "nt":
+        return set()
+
+    changed = set()
+    for pid in process_ids:
+        try:
+            psutil.Process(pid).nice(psutil.IDLE_PRIORITY_CLASS)
+            changed.add(pid)
+        except (psutil.Error, OSError):
+            pass
+    return changed
+
+
+def _get_foreground_window() -> int:
+    if os.name != "nt":
+        return 0
+
+    return int(_user32.GetForegroundWindow() or 0)
+
+
+def _send_windows_to_back(process_ids: set[int], last_external_hwnd=0) -> tuple[int, int]:
+    """将指定进程的可见顶层窗口置底，并返回最新非浏览器前台窗口。"""
+    if os.name != "nt":
+        return int(last_external_hwnd or 0), 0
+
+    current_foreground = _get_foreground_window()
+    browser_windows = []
+
+    def _collect(hwnd, _):
+        pid = wintypes.DWORD()
+        _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) in process_ids and _user32.IsWindowVisible(hwnd):
+            browser_windows.append(int(hwnd))
+        return True
+
+    _user32.EnumWindows(_window_enum_callback(_collect), 0)
+    browser_handles = set(browser_windows)
+    if current_foreground and current_foreground not in browser_handles:
+        last_external_hwnd = current_foreground
+
+    flags = 0x0001 | 0x0002 | 0x0010 | 0x4000  # NOSIZE|NOMOVE|NOACTIVATE|ASYNC
+    moved = 0
+    for hwnd in browser_windows:
+        if _user32.SetWindowPos(
+            hwnd, wintypes.HWND(1), 0, 0, 0, 0, flags
+        ):  # HWND_BOTTOM
+            moved += 1
+
+    if (
+        current_foreground in browser_handles
+        and last_external_hwnd
+        and int(last_external_hwnd) not in browser_handles
+        and _user32.IsWindow(int(last_external_hwnd))
+    ):
+        _user32.SetForegroundWindow(int(last_external_hwnd))
+    return int(last_external_hwnd or 0), moved
+
+
+def _windows_process_running(pid: int) -> bool:
+    if os.name != "nt" or pid <= 0:
+        return False
+
+    try:
+        return psutil.Process(pid).is_running()
+    except (psutil.Error, OSError):
+        return False
+
+
+def _stop_background_guard():
+    stop_event = getattr(_tls, "background_guard_stop", None)
+    if stop_event is not None:
+        stop_event.set()
+    _tls.background_guard_stop = None
+    _tls.background_guard_thread = None
+
+
+def _start_background_guard(browser_obj, previous_foreground=0, log_callback=None):
+    _stop_background_guard()
+    if os.name != "nt":
+        return
+    try:
+        root_pid = int(getattr(browser_obj, "process_id", 0) or 0)
+    except Exception:
+        root_pid = 0
+    if root_pid <= 0:
+        if log_callback:
+            log_callback("[Debug] 无法取得浏览器 PID，未设置窗口/进程优先级")
+        return
+
+    stop_event = threading.Event()
+    _tls.background_guard_stop = stop_event
+    known_process_ids: set[int] = set()
+
+    def _apply(last_external):
+        process_ids = _windows_process_tree(root_pid)
+        new_process_ids = process_ids - known_process_ids
+        changed_process_ids = _set_idle_priority(new_process_ids)
+        known_process_ids.update(changed_process_ids)
+        last_external, windows = _send_windows_to_back(process_ids, last_external)
+        return last_external, len(changed_process_ids), windows
+
+    try:
+        last_external, changed, windows = _apply(previous_foreground)
+        if log_callback:
+            log_callback(
+                f"[Debug] GUI 浏览器已降至最低优先级并置底（进程={changed}，窗口={windows}）"
+            )
+    except Exception as exc:
+        last_external = previous_foreground
+        if log_callback:
+            log_callback(f"[Debug] 设置浏览器窗口/进程优先级失败: {exc}")
+
+    def _guard():
+        nonlocal last_external
+        while not stop_event.wait(2.0):
+            if not _windows_process_running(root_pid):
+                break
+            try:
+                last_external, _, _ = _apply(last_external)
+            except Exception:
+                pass
+
+    guard_thread = threading.Thread(
+        target=_guard,
+        name=f"browser-background-{root_pid}",
+        daemon=True,
+    )
+    _tls.background_guard_thread = guard_thread
+    guard_thread.start()
 
 
 class _SessionProxy:
@@ -141,10 +321,19 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
     last_exc = None
     for attempt in range(1, 5):
         try:
+            previous_foreground = 0
+            if _keep_windows_background and os.name == "nt":
+                previous_foreground = _get_foreground_window()
             browser_obj = Chromium(create_browser_options(unique_profile=True))
             tabs = browser_obj.get_tabs()
             page_obj = tabs[-1] if tabs else browser_obj.new_tab()
             set_browser_session(browser_obj, page_obj)
+            if _keep_windows_background:
+                _start_background_guard(
+                    browser_obj,
+                    previous_foreground=previous_foreground,
+                    log_callback=log_callback,
+                )
             _note_start_success()
             profile = getattr(_tls, "profile_dir", None) or getattr(browser_obj, "user_data_path", None)
             if log_callback and profile:
@@ -155,6 +344,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
         except Exception as exc:
             last_exc = exc
             streak = _note_start_failure()
+            _stop_background_guard()
             if log_callback:
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次, 连续失败{streak}): {exc}")
             try:
@@ -169,6 +359,7 @@ def start_browser(log_callback=None) -> Tuple[object, object]:
 
 
 def stop_browser():
+    _stop_background_guard()
     current = active_browser()
     set_browser_session(None, None)
     if current is None:

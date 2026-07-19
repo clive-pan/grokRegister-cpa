@@ -9,6 +9,18 @@ import grok_register_ttk as app
 
 
 class RuntimeRegressionTests(unittest.TestCase):
+    def test_gui_runtime_wiring_keeps_browser_in_background(self):
+        with patch.object(app._bs, "configure") as configure_browser, patch.object(
+            app._rf, "configure"
+        ):
+            app._wire_runtime_modules(gui_mode=True)
+            gui_kwargs = configure_browser.call_args.kwargs
+            app._wire_runtime_modules()
+            cli_kwargs = configure_browser.call_args.kwargs
+
+        self.assertTrue(gui_kwargs["keep_windows_background"])
+        self.assertFalse(cli_kwargs["keep_windows_background"])
+
     def setUp(self):
         self.original_config = app.config.copy()
 

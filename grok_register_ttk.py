@@ -1608,9 +1608,13 @@ def should_emit_log(message: str) -> bool:
     return True
 
 
-def _wire_runtime_modules():
+def _wire_runtime_modules(gui_mode=False):
     """把主模块依赖注入到 browser_session / register_flow。"""
-    _bs.configure(get_proxies=get_proxies, extension_path=EXTENSION_PATH)
+    _bs.configure(
+        get_proxies=get_proxies,
+        extension_path=EXTENSION_PATH,
+        keep_windows_background=gui_mode,
+    )
     _rf.configure(
         get_email_and_token=get_email_and_token,
         get_oai_code=get_oai_code,
@@ -1666,7 +1670,7 @@ class GrokRegisterGUI:
 
     def setup_ui(self):
         load_config()
-        _wire_runtime_modules()
+        _wire_runtime_modules(gui_mode=True)
         main_frame = tk.Frame(self.root, bg=UI_BG, padx=10, pady=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
         main_frame.grid_columnconfigure(0, weight=1)

@@ -1,14 +1,18 @@
 import os
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import browser_session as bs
 
 
 class BrowserSessionTests(unittest.TestCase):
     def setUp(self):
-        bs.configure(get_proxies=lambda: {}, extension_path="")
+        bs.configure(
+            get_proxies=lambda: {},
+            extension_path="",
+            keep_windows_background=False,
+        )
         bs.set_browser_session(None, None)
 
     def test_create_options_unique_profile(self):
@@ -52,6 +56,29 @@ class BrowserSessionTests(unittest.TestCase):
         bs.set_browser_session(mock_browser, object())
         bs.stop_browser()
         mock_browser.quit.assert_called_once()
+
+    def test_start_browser_backgrounds_window_when_enabled(self):
+        bs.configure(
+            get_proxies=lambda: {},
+            extension_path="",
+            keep_windows_background=True,
+        )
+        mock_browser = MagicMock()
+        mock_page = object()
+        mock_browser.get_tabs.return_value = [mock_page]
+        with patch.object(bs, "Chromium", return_value=mock_browser), patch.object(
+            bs, "_start_background_guard"
+        ) as start_guard:
+            browser, page = bs.start_browser()
+
+        self.assertIs(browser, mock_browser)
+        self.assertIs(page, mock_page)
+        start_guard.assert_called_once_with(
+            mock_browser,
+            previous_foreground=ANY,
+            log_callback=None,
+        )
+        bs.stop_browser()
 
 
 if __name__ == "__main__":
